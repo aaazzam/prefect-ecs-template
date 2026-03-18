@@ -1,0 +1,823 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Prefect ECS Work Pool — full-stack deployment with Principle of Least Privilege IAM.
+  Creates a complete VPC, ECS Fargate cluster, worker service, observability pipeline,
+  and tightly scoped IAM roles. Replaces the broad Resource: "*" policies with
+  resource-scoped statements wherever AWS supports it.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Prefect Configuration
+        Parameters:
+          - WorkPoolName
+          - PrefectApiUrl
+          - PrefectApiKey
+          - PrefectApiKeySecretArn
+          - DockerImage
+      - Label:
+          default: Networking
+        Parameters:
+          - VpcCidr
+          - PublicSubnet1Cidr
+          - PublicSubnet2Cidr
+          - PrivateSubnet1Cidr
+          - PrivateSubnet2Cidr
+      - Label:
+          default: Compute
+        Parameters:
+          - TaskCpu
+          - TaskMemory
+          - DesiredCount
+          - MinCapacity
+          - MaxCapacity
+          - CpuTargetValue
+          - MemoryTargetValue
+          - ScaleOutCooldown
+          - ScaleInCooldown
+          - HealthCheckStartPeriod
+      - Label:
+          default: Observability
+        Parameters:
+          - LogRetentionDays
+
+Parameters:
+  WorkPoolName:
+    Type: String
+    Default: ecs-work-pool
+    Description: Name of the Prefect work pool. Used to name all resources.
+
+  PrefectApiUrl:
+    Type: String
+    Default: https://api.prefect.cloud/api
+    Description: Prefect API URL.
+
+  PrefectApiKey:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: >
+      Raw Prefect API key. A new Secrets Manager secret will be created.
+      Leave empty if providing PrefectApiKeySecretArn instead.
+
+  PrefectApiKeySecretArn:
+    Type: String
+    Default: ""
+    Description: >
+      ARN of an existing Secrets Manager secret containing the Prefect API key.
+      Leave empty to create a new secret from PrefectApiKey.
+
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    AllowedPattern: '(\d{1,3}\.){3}\d{1,3}/\d{1,2}'
+    Description: CIDR block for the VPC.
+
+  PublicSubnet1Cidr:
+    Type: String
+    Default: 10.0.1.0/24
+    AllowedPattern: '(\d{1,3}\.){3}\d{1,3}/\d{1,2}'
+    Description: CIDR for public subnet in AZ 1.
+
+  PublicSubnet2Cidr:
+    Type: String
+    Default: 10.0.2.0/24
+    AllowedPattern: '(\d{1,3}\.){3}\d{1,3}/\d{1,2}'
+    Description: CIDR for public subnet in AZ 2.
+
+  PrivateSubnet1Cidr:
+    Type: String
+    Default: 10.0.10.0/24
+    AllowedPattern: '(\d{1,3}\.){3}\d{1,3}/\d{1,2}'
+    Description: CIDR for private subnet in AZ 1.
+
+  PrivateSubnet2Cidr:
+    Type: String
+    Default: 10.0.11.0/24
+    AllowedPattern: '(\d{1,3}\.){3}\d{1,3}/\d{1,2}'
+    Description: CIDR for private subnet in AZ 2.
+
+  TaskCpu:
+    Type: Number
+    Default: 1024
+    AllowedValues: [256, 512, 1024, 2048, 4096]
+    Description: CPU units for the worker task (1024 = 1 vCPU).
+
+  TaskMemory:
+    Type: Number
+    Default: 2048
+    AllowedValues: [512, 1024, 2048, 4096, 8192, 16384, 30720]
+    Description: Memory in MB for the worker task.
+
+  DockerImage:
+    Type: String
+    Default: prefecthq/prefect-aws:latest
+    Description: Docker image for the Prefect worker.
+
+  DesiredCount:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    Description: Desired number of worker tasks.
+
+  MinCapacity:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    Description: Minimum number of worker tasks for auto scaling.
+
+  MaxCapacity:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    Description: Maximum number of worker tasks for auto scaling.
+
+  CpuTargetValue:
+    Type: Number
+    Default: 70
+    MinValue: 1
+    MaxValue: 100
+    Description: CPU utilization percentage to trigger scaling.
+
+  MemoryTargetValue:
+    Type: Number
+    Default: 80
+    MinValue: 1
+    MaxValue: 100
+    Description: Memory utilization percentage to trigger scaling.
+
+  ScaleOutCooldown:
+    Type: Number
+    Default: 120
+    MinValue: 0
+    Description: Seconds to wait after a scale-out before another scale-out.
+
+  ScaleInCooldown:
+    Type: Number
+    Default: 300
+    MinValue: 0
+    Description: Seconds to wait after a scale-in before another scale-in.
+
+  HealthCheckStartPeriod:
+    Type: Number
+    Default: 60
+    MinValue: 0
+    MaxValue: 1800
+    Description: Seconds to wait before the first health check. Increase if workers are slow to initialize.
+
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653]
+    Description: CloudWatch log retention in days.
+
+Conditions:
+  CreateNewSecret:
+    !And
+      - !Equals [!Ref PrefectApiKeySecretArn, ""]
+      - !Not [!Equals [!Ref PrefectApiKey, ""]]
+
+  HasApiKey:
+    !Or
+      - !Not [!Equals [!Ref PrefectApiKey, ""]]
+      - !Not [!Equals [!Ref PrefectApiKeySecretArn, ""]]
+
+Rules:
+  RequireApiKey:
+    Assertions:
+      - Assert:
+          !Or
+            - !Not [!Equals [!Ref PrefectApiKey, ""]]
+            - !Not [!Equals [!Ref PrefectApiKeySecretArn, ""]]
+        AssertDescription: >
+          You must provide either PrefectApiKey (to create a new secret)
+          or PrefectApiKeySecretArn (to use an existing secret).
+
+# ---------------------------------------------------------------------------
+# Networking
+# ---------------------------------------------------------------------------
+Resources:
+
+  # --- VPC ---
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${WorkPoolName}-vpc"
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${WorkPoolName}-igw"
+
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  # --- Public Subnets ---
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${WorkPoolName}-public-1"
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${WorkPoolName}-public-2"
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${WorkPoolName}-public-rt"
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # --- NAT Gateway (single AZ — add a second NAT in PublicSubnet2 for HA) ---
+  NatEip:
+    Type: AWS::EC2::EIP
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${WorkPoolName}-nat-eip"
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub "${WorkPoolName}-nat"
+
+  # --- Private Subnets ---
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub "${WorkPoolName}-private-1"
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub "${WorkPoolName}-private-2"
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${WorkPoolName}-private-rt"
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnet1RouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # --- Security Group ---
+  WorkerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "Security group for ${WorkPoolName} ECS workers"
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub "${WorkPoolName}-worker-sg"
+
+  # ---------------------------------------------------------------------------
+  # Secrets
+  # ---------------------------------------------------------------------------
+  PrefectApiKeySecret:
+    Type: AWS::SecretsManager::Secret
+    Condition: CreateNewSecret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Name: !Sub "${WorkPoolName}-prefect-api-key"
+      Description: Prefect API key for ECS worker
+      SecretString: !Ref PrefectApiKey
+
+  # ---------------------------------------------------------------------------
+  # ECS Cluster
+  # ---------------------------------------------------------------------------
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${WorkPoolName}-cluster"
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Tags:
+        - Key: Name
+          Value: !Sub "${WorkPoolName}-cluster"
+
+  # ---------------------------------------------------------------------------
+  # Observability — CloudWatch Log Group
+  # ---------------------------------------------------------------------------
+  WorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub
+        - "/ecs/${PoolName}-${Suffix}"
+        - PoolName: !Ref WorkPoolName
+          Suffix: !Select [0, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ---------------------------------------------------------------------------
+  # Observability — SQS Queue + DLQ for ECS task state events
+  # ---------------------------------------------------------------------------
+  EcsEventsDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub
+        - "${PoolName}-ecs-events-dlq-${Suffix}"
+        - PoolName: !Ref WorkPoolName
+          Suffix: !Select [0, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+      MessageRetentionPeriod: 1209600  # 14 days
+      VisibilityTimeout: 60
+      SqsManagedSseEnabled: true
+
+  EcsEventsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub
+        - "${PoolName}-ecs-events-${Suffix}"
+        - PoolName: !Ref WorkPoolName
+          Suffix: !Select [0, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 604800  # 7 days
+      VisibilityTimeout: 300
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt EcsEventsDlq.Arn
+        maxReceiveCount: 3
+
+  EcsEventsQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref EcsEventsQueue
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowEventBridgeSendMessage
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt EcsEventsQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt EcsTaskStateChangeRule.Arn
+
+  # ---------------------------------------------------------------------------
+  # Observability — EventBridge Rule scoped to cluster
+  # ---------------------------------------------------------------------------
+  EcsTaskStateChangeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub
+        - "${PoolName}-ecs-task-events-${Suffix}"
+        - PoolName: !Ref WorkPoolName
+          Suffix: !Select [0, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+      Description: Capture ECS task state changes for Prefect workers
+      EventPattern:
+        source:
+          - aws.ecs
+        detail-type:
+          - ECS Task State Change
+        detail:
+          clusterArn:
+            - !GetAtt EcsCluster.Arn
+      Targets:
+        - Id: EcsEventsQueue
+          Arn: !GetAtt EcsEventsQueue.Arn
+
+  # ---------------------------------------------------------------------------
+  # IAM — Task Execution Role
+  # ---------------------------------------------------------------------------
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+      Policies:
+        - PolicyName: PrefectSecretAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: GetPrefectApiKeySecret
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  !If
+                    - CreateNewSecret
+                    - !Ref PrefectApiKeySecret
+                    - !Ref PrefectApiKeySecretArn
+
+  # ---------------------------------------------------------------------------
+  # IAM — Task Role (PoLP: 7 scoped statements + PassRole in separate policy)
+  # ---------------------------------------------------------------------------
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PrefectWorkerPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # ----------------------------------------------------------
+              # 1. ECS cluster-scoped actions
+              # ----------------------------------------------------------
+              - Sid: EcsClusterScoped
+                Effect: Allow
+                Action:
+                  - ecs:RunTask
+                  - ecs:StopTask
+                  - ecs:ListTasks
+                  - ecs:DescribeTasks
+                  - ecs:DescribeClusters
+                  - ecs:TagResource
+                Resource:
+                  - !GetAtt EcsCluster.Arn
+                  - !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task/${EcsCluster}/*"
+                  - !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/*"
+
+              # ----------------------------------------------------------
+              # 2. ECS task-definition actions — AWS does not support
+              #    resource-level permissions for these; isolated in own
+              #    statement for auditability.
+              # ----------------------------------------------------------
+              - Sid: EcsTaskDefinitionActions
+                Effect: Allow
+                Action:
+                  - ecs:RegisterTaskDefinition
+                  - ecs:DeregisterTaskDefinition
+                  - ecs:DescribeTaskDefinition
+                  - ecs:ListTaskDefinitions
+                Resource: "*"
+
+              # ----------------------------------------------------------
+              # 3. EC2 read-only describes — AWS requires Resource: "*"
+              # ----------------------------------------------------------
+              - Sid: Ec2DescribeReadOnly
+                Effect: Allow
+                Action:
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeNetworkInterfaces
+                Resource: "*"
+
+              # ----------------------------------------------------------
+              # 4. CloudWatch Logs — scoped to exact log group
+              # ----------------------------------------------------------
+              - Sid: CloudWatchLogsScopedToLogGroup
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !GetAtt WorkerLogGroup.Arn
+                  - !Sub "${WorkerLogGroup.Arn}:*"
+
+              # ----------------------------------------------------------
+              # 5. CloudWatch Logs — read-only for flow run log groups.
+              #    DescribeLogGroups requires Resource: "*" (AWS limitation).
+              #    GetLogEvents/DescribeLogStreams need :* stream suffix.
+              #    Scoped to /ecs/* and /prefect* prefixes. Add more
+              #    patterns if flow runs log to other groups.
+              # ----------------------------------------------------------
+              - Sid: CloudWatchLogsDescribeLogGroups
+                Effect: Allow
+                Action:
+                  - logs:DescribeLogGroups
+                Resource: "*"
+
+              - Sid: CloudWatchLogsFlowRunReadOnly
+                Effect: Allow
+                Action:
+                  - logs:GetLogEvents
+                  - logs:DescribeLogStreams
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ecs/*:*"
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/prefect*:*"
+
+              # ----------------------------------------------------------
+              # 6. SSM permissions for ECS Exec
+              # ----------------------------------------------------------
+              - Sid: EcsExecSsmPermissions
+                Effect: Allow
+                Action:
+                  - ssmmessages:CreateControlChannel
+                  - ssmmessages:CreateDataChannel
+                  - ssmmessages:OpenControlChannel
+                  - ssmmessages:OpenDataChannel
+                Resource: "*"
+
+              # ----------------------------------------------------------
+              # 7. SQS — scoped to exact event queue
+              # ----------------------------------------------------------
+              - Sid: SqsConsumeFromEventQueue
+                Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:GetQueueUrl
+                Resource: !GetAtt EcsEventsQueue.Arn
+
+  # ---------------------------------------------------------------------------
+  # IAM — PassRole policy (separate resource to avoid circular dependency)
+  # Scoped to only the two roles created by this stack. If you configure
+  # custom execution or task roles in your work pool base job template,
+  # add their ARNs to the Resource list below.
+  # ---------------------------------------------------------------------------
+  TaskRolePassRolePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: PrefectWorkerPassRole
+      Roles:
+        - !Ref TaskRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: IamPassRoleScopedToStackRoles
+            Effect: Allow
+            Action:
+              - iam:PassRole
+            Resource:
+              - !GetAtt TaskExecutionRole.Arn
+              - !GetAtt TaskRole.Arn
+            Condition:
+              StringEquals:
+                iam:PassedToService: ecs-tasks.amazonaws.com
+
+  # ---------------------------------------------------------------------------
+  # ECS Task Definition
+  # ---------------------------------------------------------------------------
+  WorkerTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${WorkPoolName}-worker"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: prefect-worker
+          Image: !Ref DockerImage
+          Essential: true
+          Command:
+            - sh
+            - -c
+            - !Sub >-
+              prefect worker start
+              --type ecs
+              --pool ${WorkPoolName}
+              --with-healthcheck
+          Environment:
+            - Name: PREFECT_API_URL
+              Value: !Ref PrefectApiUrl
+            - Name: PREFECT_INTEGRATIONS_AWS_ECS_OBSERVER_ENABLED
+              Value: "true"
+            - Name: PREFECT_INTEGRATIONS_AWS_ECS_OBSERVER_SQS_QUEUE_NAME
+              Value: !GetAtt EcsEventsQueue.QueueName
+          Secrets: !If
+            - HasApiKey
+            - - Name: PREFECT_API_KEY
+                ValueFrom: !If
+                  - CreateNewSecret
+                  - !Ref PrefectApiKeySecret
+                  - !Ref PrefectApiKeySecretArn
+            - !Ref AWS::NoValue
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref WorkerLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/health', timeout=5)\""
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: !Ref HealthCheckStartPeriod
+          PortMappings:
+            - ContainerPort: 8080
+              Protocol: tcp
+              Name: health
+
+  # ---------------------------------------------------------------------------
+  # ECS Service
+  # ---------------------------------------------------------------------------
+  WorkerService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub "${WorkPoolName}-workers"
+      Cluster: !Ref EcsCluster
+      TaskDefinition: !Ref WorkerTaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      EnableExecuteCommand: true
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - !Ref PrivateSubnet1
+            - !Ref PrivateSubnet2
+          SecurityGroups:
+            - !Ref WorkerSecurityGroup
+
+  # ---------------------------------------------------------------------------
+  # Auto Scaling
+  # ---------------------------------------------------------------------------
+  AutoScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: !Ref MaxCapacity
+      MinCapacity: !Ref MinCapacity
+      ResourceId: !Sub
+        - "service/${ClusterName}/${ServiceName}"
+        - ClusterName: !Ref EcsCluster
+          ServiceName: !GetAtt WorkerService.Name
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+
+  CpuScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub "${WorkPoolName}-cpu-scaling"
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref AutoScalingTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        TargetValue: !Ref CpuTargetValue
+        ScaleInCooldown: !Ref ScaleInCooldown
+        ScaleOutCooldown: !Ref ScaleOutCooldown
+
+  MemoryScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub "${WorkPoolName}-memory-scaling"
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref AutoScalingTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageMemoryUtilization
+        TargetValue: !Ref MemoryTargetValue
+        ScaleInCooldown: !Ref ScaleInCooldown
+        ScaleOutCooldown: !Ref ScaleOutCooldown
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+  VpcId:
+    Description: VPC ID
+    Value: !Ref Vpc
+
+  PrivateSubnetIds:
+    Description: Private subnet IDs (comma-separated)
+    Value: !Join [",", [!Ref PrivateSubnet1, !Ref PrivateSubnet2]]
+
+  ClusterArn:
+    Description: ECS cluster ARN
+    Value: !GetAtt EcsCluster.Arn
+
+  ServiceArn:
+    Description: ECS service ARN
+    Value: !Ref WorkerService
+
+  ServiceName:
+    Description: ECS service name
+    Value: !GetAtt WorkerService.Name
+
+  TaskDefinitionArn:
+    Description: Task definition ARN
+    Value: !Ref WorkerTaskDefinition
+
+  TaskExecutionRoleArn:
+    Description: Task execution role ARN
+    Value: !GetAtt TaskExecutionRole.Arn
+
+  TaskRoleArn:
+    Description: Task role ARN
+    Value: !GetAtt TaskRole.Arn
+
+  LogGroupName:
+    Description: CloudWatch log group name
+    Value: !Ref WorkerLogGroup
+
+  EcsEventsQueueUrl:
+    Description: SQS queue URL for ECS task state events
+    Value: !Ref EcsEventsQueue
+
+  EcsEventsQueueArn:
+    Description: SQS queue ARN for ECS task state events
+    Value: !GetAtt EcsEventsQueue.Arn
+
+  PrefectApiKeySecretArn:
+    Condition: CreateNewSecret
+    Description: ARN of the created Prefect API key secret
+    Value: !Ref PrefectApiKeySecret
