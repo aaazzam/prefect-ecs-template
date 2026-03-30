@@ -769,6 +769,217 @@ Resources:
         ScaleInCooldown: !Ref ScaleInCooldown
         ScaleOutCooldown: !Ref ScaleOutCooldown
 
+  # ---------------------------------------------------------------------------
+  # Work Pool Base Job Template Configuration — Lambda + Custom Resource
+  # ---------------------------------------------------------------------------
+  WorkPoolConfigLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${WorkPoolName}-work-pool-config-lambda"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaLogsAndSecrets
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${WorkPoolName}-work-pool-config*"
+              - Sid: ReadPrefectApiKeySecret
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  !If
+                    - CreateNewSecret
+                    - !Ref PrefectApiKeySecret
+                    - !Ref PrefectApiKeySecretArn
+
+  WorkPoolConfigFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${WorkPoolName}-work-pool-config"
+      Description: Configures the Prefect work pool base job template with stack resource ARNs
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      Role: !GetAtt WorkPoolConfigLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import urllib.parse
+          import urllib.request
+          import boto3
+          import cfnresponse
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def get_api_key(secret_arn):
+              client = boto3.client("secretsmanager")
+              resp = client.get_secret_value(SecretId=secret_arn)
+              return resp["SecretString"]
+
+          def prefect_request(method, url, api_key, data=None):
+              body = json.dumps(data).encode() if data else None
+              req = urllib.request.Request(
+                  url,
+                  data=body,
+                  method=method,
+                  headers={
+                      "Authorization": f"Bearer {api_key}",
+                      "Content-Type": "application/json",
+                  },
+              )
+              with urllib.request.urlopen(req, timeout=15) as resp:
+                  if resp.status == 204:
+                      return None
+                  return json.loads(resp.read().decode())
+
+          def get_default_template(api_url, api_key, pool_type="ecs"):
+              """Fetch the default base job template for a work pool type."""
+              types_url = f"{api_url}/collections/work_pool_types"
+              data = prefect_request("GET", types_url, api_key)
+              for collection in data.values():
+                  if pool_type in collection:
+                      tpl = collection[pool_type].get("default_base_job_configuration", {})
+                      if tpl:
+                          return tpl
+              raise ValueError(f"No default template found for pool type '{pool_type}'")
+
+          def set_variable_defaults(template, props):
+              """Set defaults on the template's variables from stack resource properties."""
+              vp = template.get("variables", {}).get("properties", {})
+              defaults = {
+                  "cluster": props["ClusterArn"],
+                  "vpc_id": props["VpcId"],
+                  "execution_role_arn": props["ExecutionRoleArn"],
+                  "task_role_arn": props["TaskRoleArn"],
+                  "launch_type": "FARGATE",
+                  "configure_cloudwatch_logs": True,
+                  "cloudwatch_logs_options": {
+                      "awslogs-group": props["LogGroupName"],
+                      "awslogs-region": props["Region"],
+                      "awslogs-stream-prefix": "ecs",
+                  },
+                  "network_configuration": {
+                      "awsvpcConfiguration": {
+                          "subnets": props["SubnetIds"],
+                          "securityGroups": [props["SecurityGroupId"]],
+                          "assignPublicIp": "DISABLED",
+                      }
+                  },
+              }
+              for key, value in defaults.items():
+                  if key in vp:
+                      vp[key]["default"] = value
+                  else:
+                      logger.warning("Variable '%s' not found in template schema", key)
+
+          def handler(event, context):
+              try:
+                  logger.info("Event: %s", json.dumps(event, default=str))
+                  request_type = event["RequestType"]
+
+                  if request_type == "Delete":
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+
+                  props = event["ResourceProperties"]
+                  api_url = props["PrefectApiUrl"].rstrip("/")
+                  pool_name = props["WorkPoolName"]
+                  secret_arn = props["SecretArn"]
+
+                  api_key = get_api_key(secret_arn)
+                  encoded_pool = urllib.parse.quote(pool_name, safe="")
+                  pool_url = f"{api_url}/work_pools/{encoded_pool}"
+
+                  # Fetch the default ECS template from Prefect's collections API
+                  default_template = get_default_template(api_url, api_key)
+                  logger.info("Fetched default ECS template")
+
+                  if request_type == "Create":
+                      # Create the pool with the full default template + our defaults
+                      set_variable_defaults(default_template, props)
+                      pools_url = f"{api_url}/work_pools/"
+                      try:
+                          prefect_request("POST", pools_url, api_key, data={
+                              "name": pool_name,
+                              "type": "ecs",
+                              "base_job_template": default_template,
+                          })
+                          logger.info("Created work pool '%s'", pool_name)
+                      except urllib.error.HTTPError as e:
+                          if e.code == 409:
+                              logger.info("Work pool '%s' already exists, will update", pool_name)
+                          else:
+                              raise
+                          # Pool exists — fall through to Update logic
+                      else:
+                          # Created successfully with template, we're done
+                          cfnresponse.send(
+                              event, context, cfnresponse.SUCCESS,
+                              {"Result": f"Created and configured work pool {pool_name}"},
+                              physicalResourceId=f"{pool_name}-base-job-template",
+                          )
+                          return
+
+                  # Update (or Create that hit 409): GET existing template, set defaults, PATCH
+                  pool = prefect_request("GET", pool_url, api_key)
+                  template = pool.get("base_job_template", {})
+
+                  # If template is empty/missing variables, use the default
+                  if not template.get("variables", {}).get("properties"):
+                      logger.info("Existing template is empty, using default")
+                      template = default_template
+
+                  set_variable_defaults(template, props)
+                  prefect_request("PATCH", pool_url, api_key, data={"base_job_template": template})
+                  logger.info("Successfully configured work pool '%s'", pool_name)
+
+                  cfnresponse.send(
+                      event, context, cfnresponse.SUCCESS,
+                      {"Result": f"Configured work pool {pool_name}"},
+                      physicalResourceId=f"{pool_name}-base-job-template",
+                  )
+
+              except Exception:
+                  logger.exception("Failed to configure work pool base job template")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  WorkPoolBaseJobTemplateConfig:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt WorkPoolConfigFunction.Arn
+      PrefectApiUrl: !Ref PrefectApiUrl
+      WorkPoolName: !Ref WorkPoolName
+      SecretArn:
+        !If
+          - CreateNewSecret
+          - !Ref PrefectApiKeySecret
+          - !Ref PrefectApiKeySecretArn
+      ClusterArn: !GetAtt EcsCluster.Arn
+      VpcId: !Ref Vpc
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupId: !Ref WorkerSecurityGroup
+      LogGroupName: !Ref WorkerLogGroup
+      Region: !Ref AWS::Region
+
 # ---------------------------------------------------------------------------
 # Outputs
 # ---------------------------------------------------------------------------
@@ -821,3 +1032,11 @@ Outputs:
     Condition: CreateNewSecret
     Description: ARN of the created Prefect API key secret
     Value: !Ref PrefectApiKeySecret
+
+  WorkPoolConfigFunctionArn:
+    Description: ARN of the Lambda that configures the work pool base job template
+    Value: !GetAtt WorkPoolConfigFunction.Arn
+
+  WorkPoolConfigResult:
+    Description: Result of the work pool base job template configuration
+    Value: !GetAtt WorkPoolBaseJobTemplateConfig.Result
